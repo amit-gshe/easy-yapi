@@ -112,12 +112,18 @@ jobs:
             echo
             echo "### Changes"
             echo
-            # Commits since the previous build of `main`. The very first build has no
-            # predecessor, so it falls back to the newest upstream release tag — that way the
-            # first build still describes what it adds instead of naming a single commit.
+            # Commits since the previous build of `main`. A first build — or one cut after the
+            # tags were reset — has no predecessor to compare against, so it falls back to the
+            # newest upstream release tag and then to the upstream mirror branch, leaving the
+            # build describing what it adds rather than naming a single commit. The fork does
+            # not carry upstream's tags, so in practice that means the mirror branch.
             prev=$(git tag -l 'v*-main.*' --sort=-creatordate | head -1 || true)
             if [ -z "$prev" ]; then
               prev=$(git tag -l 'v*' --sort=-creatordate | grep -v -- '-main\.' | head -1 || true)
+            fi
+            if [ -z "$prev" ]; then
+              prev=$(git rev-parse --verify --quiet origin/master \
+                  || git rev-parse --verify --quiet master || true)
             fi
             if [ -n "$prev" ]; then
               git log --pretty=format:'* %s' "${prev}..HEAD" \
