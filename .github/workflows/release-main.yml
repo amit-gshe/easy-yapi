@@ -153,6 +153,11 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
+          # The action tags the repository's DEFAULT branch (here: master) unless told
+          # otherwise, which would leave every tag pointing at a commit this workflow never
+          # built — and the next build's changelog range computed from it. Pin it to the
+          # commit being released instead.
+          target_commitish: ${{ github.sha }}
           body_path: release-notes.md
           # Pre-release on purpose: `main` carries work that has not been through a release
           # cycle, so it must not take the "Latest" slot away from upstream's tags.
