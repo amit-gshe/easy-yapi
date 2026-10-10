@@ -1,0 +1,157 @@
+name: 'Release from main'
+
+# Packages the plugin from `main` and publishes it as a pre-release, so the newest main
+# build can always be downloaded and installed without a manual `script/package.sh` run.
+# Every push to `main` gets its own uniquely versioned build.
+#
+# Deliberately separate from release.yml (upstream's master-driven, commit-keyword-gated
+# release): this is a fork, so syncing upstream `master` into `main` must never have to
+# resolve a conflict inside a workflow file.
+#
+# The version is `<pluginBaseVersion>-main.<run number>` (e.g. 3.2.5-main.7.252.0) rather
+# than the bare `<pluginBaseVersion>`. Upstream's release tags already own the plain
+# `v3.2.5` name, so reusing it would collide with them; and tagging per run means no push
+# is silently skipped while it waits for a version bump.
+
+on:
+  push:
+    branches: [ main ]
+  # Re-cut a release by hand without an empty commit — useful when a run died for an
+  # infrastructure reason rather than a code one.
+  workflow_dispatch:
+
+# `softprops/action-gh-release` creates the tag and the release; the default GITHUB_TOKEN
+# is read-only on newer repositories.
+permissions:
+  contents: write
+
+env:
+  # Compatibility package range: IDEA 2022.1 (build 221) through the last build before the
+  # officially supported range, mirroring release.yml so both release paths ship the same
+  # set of packages. The lower bound of the officially supported range is
+  # `pluginSinceBuild` in gradle.properties; naming the other end here keeps the magic
+  # numbers out of the steps below.
+  COMPAT_SINCE: '221'
+  COMPAT_UNTIL: '251'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags are required: the changelog is built from the previous `-main.` tag, so it
+          # has to be visible.
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          base=$(sed -n 's/^pluginBaseVersion=//p' gradle.properties | head -1 | tr -d '[:space:]')
+          since=$(sed -n 's/^pluginSinceBuild=//p' gradle.properties | head -1 | tr -d '[:space:]')
+          if [ -z "$base" ]; then
+            echo "::error::pluginBaseVersion not found in gradle.properties"
+            exit 1
+          fi
+          echo "plugin_base=${base}-main.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${base}-main.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "default_since=${since:-252}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'zulu'
+          cache: gradle
+
+      # A release must not ship a build the suite rejects. This is also the only test
+      # coverage pushes to `main` get: ci.yml watches upstream's `master`, not this branch.
+      - name: Test
+        run: ./gradlew test --stacktrace
+
+      - name: Build plugin
+        run: ./gradlew buildPlugin --stacktrace -PpluginBaseVersion=${{ steps.version.outputs.plugin_base }}
+
+      - name: Build compatibility package
+        # Best-effort, exactly as in release.yml: only the default package is required, and
+        # the sources are compiled against the newest platform either way — only the
+        # declared compatibility range changes — so behaviour on older IDEs is unverified.
+        run: |
+          set -euo pipefail
+          ./gradlew buildPlugin --stacktrace \
+            -PpluginBaseVersion=${{ steps.version.outputs.plugin_base }} \
+            -PpluginSinceBuild="${COMPAT_SINCE}" -PpluginUntilBuild="${COMPAT_UNTIL}" \
+            || echo "::warning::Compatibility build failed — releasing the default package only"
+
+      - name: Write release notes
+        env:
+          PLUGIN_BASE: ${{ steps.version.outputs.plugin_base }}
+          TAG: ${{ steps.version.outputs.tag }}
+          DEFAULT_SINCE: ${{ steps.version.outputs.default_since }}
+        run: |
+          set -euo pipefail
+          notes=release-notes.md
+
+          # IntelliJ build number to product version: 252 -> 2025.2.
+          build_to_product() {
+            local b="${1%%.*}"
+            echo "20${b:0:2}.${b:2:1}"
+          }
+
+          # One table row per package that actually made it into this run.
+          row() { # $1=zip file name, $2=IDE support label, $3=support blurb
+            [ -f "build/distributions/$1" ] || return 0
+            echo "| [\`$1\`](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$1) | $2 — $3 |"
+          }
+
+          {
+            echo "Automated build of \`main\` at [\`${GITHUB_SHA:0:7}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo
+            echo "Plugin version: \`${PLUGIN_BASE}.${DEFAULT_SINCE}.0\`"
+            echo
+            echo "### Changes"
+            echo
+            # Commits since the previous build of `main`; the first build has no predecessor
+            # to compare against, so it lists the commit it was cut from.
+            prev=$(git tag -l 'v*-main.*' --sort=-creatordate | head -1 || true)
+            if [ -n "$prev" ]; then
+              git log --pretty=format:'* %s' "${prev}..HEAD" \
+                | grep -E '^\* (feat|fix|refactor|perf|docs|test|build|ci|chore)' || true
+            else
+              printf '* %s\n' "$(git log -1 --pretty=format:'%s')"
+            fi
+            echo
+            echo
+            echo "### Downloads"
+            echo
+            echo "| Plugin | IDE Support |"
+            echo "| ------ | ----------- |"
+            row "easy-yapi-${PLUGIN_BASE}.${DEFAULT_SINCE}.0.zip" \
+              "IntelliJ IDEA $(build_to_product "$DEFAULT_SINCE")+" \
+              "officially supported"
+            row "easy-yapi-${PLUGIN_BASE}.${COMPAT_SINCE}.${COMPAT_UNTIL}.zip" \
+              "IntelliJ IDEA $(build_to_product "$COMPAT_SINCE") – $(build_to_product "$COMPAT_UNTIL")" \
+              "best-effort: compiled against the newest platform, not verified on older IDEs"
+          } > "$notes"
+
+          cat "$notes"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: easy-yapi-${{ steps.version.outputs.plugin_base }}
+          path: build/distributions/*.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: release-notes.md
+          # Pre-release on purpose: `main` carries work that has not been through a release
+          # cycle, so it must not take the "Latest" slot away from upstream's tags.
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: build/distributions/*.zip
