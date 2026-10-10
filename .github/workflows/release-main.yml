@@ -112,9 +112,13 @@ jobs:
             echo
             echo "### Changes"
             echo
-            # Commits since the previous build of `main`; the first build has no predecessor
-            # to compare against, so it lists the commit it was cut from.
+            # Commits since the previous build of `main`. The very first build has no
+            # predecessor, so it falls back to the newest upstream release tag — that way the
+            # first build still describes what it adds instead of naming a single commit.
             prev=$(git tag -l 'v*-main.*' --sort=-creatordate | head -1 || true)
+            if [ -z "$prev" ]; then
+              prev=$(git tag -l 'v*' --sort=-creatordate | grep -v -- '-main\.' | head -1 || true)
+            fi
             if [ -n "$prev" ]; then
               git log --pretty=format:'* %s' "${prev}..HEAD" \
                 | grep -E '^\* (feat|fix|refactor|perf|docs|test|build|ci|chore)' || true
